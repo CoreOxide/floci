@@ -17,6 +17,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Base64;
+import java.util.List;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 import static io.restassured.RestAssured.given;
@@ -170,6 +171,204 @@ class CloudFormationIntegrationTest {
             .statusCode(200)
             .body(containsString("<StackName>test-stack</StackName>"))
             .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+    }
+
+    @Test
+    void createStacks_withSameIamInlinePolicyName() {
+        String policyName = "IamTaskRoleDefaultPolicy54CEC625";
+
+        for (String suffix : List.of("a", "b")) {
+            String stackName = "cfn-inline-policy-stack-" + suffix;
+            String roleName = "cfn-inline-policy-role-" + suffix;
+            String template = """
+                {
+                  "Resources": {
+                    "TaskRole": {
+                      "Type": "AWS::IAM::Role",
+                      "Properties": {
+                        "RoleName": "%s",
+                        "AssumeRolePolicyDocument": {
+                          "Version": "2012-10-17",
+                          "Statement": []
+                        }
+                      }
+                    },
+                    "TaskRoleDefaultPolicy": {
+                      "Type": "AWS::IAM::Policy",
+                      "Properties": {
+                        "PolicyName": "%s",
+                        "PolicyDocument": {
+                          "Version": "2012-10-17",
+                          "Statement": [{
+                            "Effect": "Allow",
+                            "Action": "logs:CreateLogStream",
+                            "Resource": "*"
+                          }]
+                        },
+                        "Roles": [{ "Ref": "TaskRole" }]
+                      }
+                    }
+                  }
+                }
+                """.formatted(roleName, policyName);
+
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "CreateStack")
+                .formParam("StackName", stackName)
+                .formParam("TemplateBody", template)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body(containsString("<StackId>"));
+
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DescribeStacks")
+                .formParam("StackName", stackName)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "GetRolePolicy")
+                .formParam("RoleName", roleName)
+                .formParam("PolicyName", policyName)
+                .header("Authorization",
+                        "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body(containsString("<PolicyName>" + policyName + "</PolicyName>"));
+        }
+
+        String movedPolicyTemplate = """
+            {
+              "Resources": {
+                "TaskRole": {
+                  "Type": "AWS::IAM::Role",
+                  "Properties": {
+                    "RoleName": "cfn-inline-policy-role-a",
+                    "AssumeRolePolicyDocument": {
+                      "Version": "2012-10-17",
+                      "Statement": []
+                    }
+                  }
+                },
+                "TaskRoleDefaultPolicy": {
+                  "Type": "AWS::IAM::Policy",
+                  "Properties": {
+                    "PolicyName": "%s",
+                    "PolicyDocument": {
+                      "Version": "2012-10-17",
+                      "Statement": []
+                    },
+                    "Roles": ["cfn-inline-policy-role-b"]
+                  }
+                }
+              }
+            }
+            """.formatted(policyName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", "cfn-inline-policy-stack-a")
+            .formParam("TemplateBody", movedPolicyTemplate)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", "cfn-inline-policy-stack-a")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetRolePolicy")
+            .formParam("RoleName", "cfn-inline-policy-role-a")
+            .formParam("PolicyName", policyName)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(404);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetRolePolicy")
+            .formParam("RoleName", "cfn-inline-policy-role-b")
+            .formParam("PolicyName", policyName)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<PolicyName>" + policyName + "</PolicyName>"));
+
+        String invalidPolicyTemplate = """
+            {
+              "Resources": {
+                "TaskRoleDefaultPolicy": {
+                  "Type": "AWS::IAM::Policy",
+                  "Properties": {
+                    "PolicyName": "%s",
+                    "PolicyDocument": {
+                      "Version": "2012-10-17",
+                      "Statement": []
+                    },
+                    "Roles": ["cfn-inline-policy-role-a", "missing-inline-policy-role"]
+                  }
+                }
+              }
+            }
+            """.formatted(policyName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-inline-policy-failing-stack")
+            .formParam("TemplateBody", invalidPolicyTemplate)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", "cfn-inline-policy-failing-stack")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetRolePolicy")
+            .formParam("RoleName", "cfn-inline-policy-role-a")
+            .formParam("PolicyName", policyName)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(404);
     }
 
     @Test
@@ -5642,6 +5841,81 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void createStack_ecsTaskDefWithSecrets_resolvesRefToSecretArnInValueFrom() {
+        String template = """
+            {
+              "Resources": {
+                "DbPassword": {
+                  "Type": "AWS::SecretsManager::Secret",
+                  "Properties": {
+                    "Name": "cfn-ecs-secret",
+                    "SecretString": "password"
+                  }
+                },
+                "TaskDef": {
+                  "Type": "AWS::ECS::TaskDefinition",
+                  "Properties": {
+                    "Family": "cfn-ecs-secrets-taskdef",
+                    "ContainerDefinitions": [
+                      {
+                        "Name": "web",
+                        "Image": "nginx:latest",
+                        "Essential": true,
+                        "Secrets": [
+                          { "Name": "DB_PASSWORD", "ValueFrom": { "Ref": "DbPassword" } }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              },
+              "Outputs": {
+                "SecretArn": { "Value": { "Ref": "DbPassword" } }
+              }
+            }
+            """;
+
+        String stackName = "cfn-ecs-secrets-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        String describeXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"))
+            .extract().asString();
+
+        // Ref on AWS::SecretsManager::Secret resolves to the secret's ARN (confirmed independently
+        // via the stack Output above). The same ARN, not the literal {"Ref": "DbPassword"} JSON,
+        // must end up in the registered task definition's Secrets[].ValueFrom.
+        String secretArn = outputValue(describeXml, "SecretArn");
+        given()
+            .header("X-Amz-Target", ECS_TARGET_PREFIX + "DescribeTaskDefinition")
+            .contentType(ECS_CONTENT_TYPE)
+            .body("{\"taskDefinition\": \"cfn-ecs-secrets-taskdef\"}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("taskDefinition.containerDefinitions[0].secrets[0].name", equalTo("DB_PASSWORD"))
+            .body("taskDefinition.containerDefinitions[0].secrets[0].valueFrom", equalTo(secretArn));
+    }
+
+    @Test
     void updateStack_ecsService_registersNewTaskDefRevisionAndUpdatesDesiredCount() {
         String stackName = "cfn-ecs-update-stack";
         String template = """
@@ -6427,6 +6701,122 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+    }
+
+    // ── SAM AWS::Serverless::Function PackageType: Image dropped by the transform ──
+
+    @Test
+    void createStack_samFunctionWithPackageTypeImageDeploysAsImageFunction() {
+        // Without PackageType carried through by the SAM transform, CloudFormationResourceProvisioner
+        // defaults PackageType to "Zip" (buildLambdaDesiredState's resolveOrDefault), which then also
+        // forces Runtime/Handler defaults onto a function that declared neither — the function is
+        // created as a broken Zip function instead of running the real container image.
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyFunction": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "PackageType": "Image",
+                    "ImageUri": "000000000000.dkr.ecr.us-east-1.localhost:5100/my-repo:latest"
+                  }
+                }
+              }
+            }
+            """;
+
+        String stackName = "cfn-sam-image-function-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+            .formParam("Capabilities", "CAPABILITY_IAM")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        String resourcesXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+
+        String functionName = physicalIdByLogicalId(resourcesXml, "MyFunction");
+
+        given()
+            .when().get("/2015-03-31/functions/" + functionName)
+            .then()
+            .statusCode(200)
+            .body("Configuration.PackageType", equalTo("Image"))
+            .body("Code.ImageUri", equalTo("000000000000.dkr.ecr.us-east-1.localhost:5100/my-repo:latest"));
+    }
+
+    @Test
+    void createStack_samFunctionWithImageConfigDeploysWithOverrides() {
+        // ImageConfig must also be carried through the SAM transform to CloudFormationResourceProvisioner,
+        // which already reads it (provisionLambda's putResolvedMapIfPresent(configRequest, props,
+        // "ImageConfig", ...)) — without the transform copying it, a PackageType: Image SAM function's
+        // EntryPoint/Command/WorkingDirectory override silently never reaches the deployed function.
+        String template = """
+            {
+              "Transform": "AWS::Serverless-2016-10-31",
+              "Resources": {
+                "MyFunction": {
+                  "Type": "AWS::Serverless::Function",
+                  "Properties": {
+                    "PackageType": "Image",
+                    "ImageUri": "000000000000.dkr.ecr.us-east-1.localhost:5100/my-repo:latest",
+                    "ImageConfig": {
+                      "EntryPoint": ["/bootstrap"],
+                      "Command": ["handler.main"],
+                      "WorkingDirectory": "/var/task"
+                    }
+                  }
+                }
+              }
+            }
+            """;
+
+        String stackName = "cfn-sam-imageconfig-function-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+            .formParam("Capabilities", "CAPABILITY_IAM")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        String resourcesXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+
+        String functionName = physicalIdByLogicalId(resourcesXml, "MyFunction");
+
+        given()
+            .when().get("/2015-03-31/functions/" + functionName)
+            .then()
+            .statusCode(200)
+            .body("Configuration.ImageConfigResponse.ImageConfig.EntryPoint[0]", equalTo("/bootstrap"))
+            .body("Configuration.ImageConfigResponse.ImageConfig.Command[0]", equalTo("handler.main"))
+            .body("Configuration.ImageConfigResponse.ImageConfig.WorkingDirectory", equalTo("/var/task"));
     }
 
     private static final String SFN_CONTENT_TYPE = "application/x-amz-json-1.0";
