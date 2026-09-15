@@ -78,6 +78,8 @@ public interface EmulatorConfig {
 
     DnsConfig dns();
 
+    NetworkConfig network();
+
     AuthConfig auth();
 
     SecurityConfig security();
@@ -91,6 +93,18 @@ public interface EmulatorConfig {
     TlsConfig tls();
 
     ProtocolsConfig protocols();
+
+    interface NetworkConfig {
+        SecurityGroupEnforcementConfig securityGroupEnforcement();
+    }
+
+    interface SecurityGroupEnforcementConfig {
+        @WithDefault("false")
+        boolean enabled();
+
+        @WithDefault("floci/network-helper:local")
+        String helperImage();
+    }
 
     interface ProtocolsConfig {
         /**

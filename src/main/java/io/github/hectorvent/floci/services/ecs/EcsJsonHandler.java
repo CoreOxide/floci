@@ -1136,6 +1136,23 @@ public class EcsJsonHandler {
         if (t.getStartedAt() != null) { n.put("startedAt", t.getStartedAt().toEpochMilli() / 1000.0); }
         if (t.getStoppedAt() != null) { n.put("stoppedAt", t.getStoppedAt().toEpochMilli() / 1000.0); }
         if (t.getStoppedReason() != null) { n.put("stoppedReason", t.getStoppedReason()); }
+        if (t.getNetworkInterfaceId() != null) {
+            ObjectNode attachment = objectMapper.createObjectNode();
+            attachment.put("id", "eni-attach-" + t.getNetworkInterfaceId());
+            attachment.put("type", "ElasticNetworkInterface");
+            attachment.put("status", "ATTACHED");
+            ArrayNode details = objectMapper.createArrayNode();
+            if (t.getNetworkConfiguration() != null
+                    && t.getNetworkConfiguration().getAwsvpcConfiguration() != null
+                    && !t.getNetworkConfiguration().getAwsvpcConfiguration().getSubnets().isEmpty()) {
+                details.addObject().put("name", "subnetId").put("value",
+                        t.getNetworkConfiguration().getAwsvpcConfiguration().getSubnets().getFirst());
+            }
+            details.addObject().put("name", "networkInterfaceId").put("value", t.getNetworkInterfaceId());
+            details.addObject().put("name", "privateIPv4Address").put("value", t.getPrivateIpAddress());
+            attachment.set("details", details);
+            n.putArray("attachments").add(attachment);
+        }
 
         ArrayNode containers = objectMapper.createArrayNode();
         if (t.getContainers() != null) {

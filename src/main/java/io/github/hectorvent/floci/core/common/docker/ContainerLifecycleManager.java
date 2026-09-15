@@ -12,6 +12,7 @@ import com.github.dockerjava.api.command.ListVolumesResponse;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Bind;
+import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.ExposedPort;
@@ -848,6 +849,9 @@ public class ContainerLifecycleManager {
         // Privileged mode (required for e.g. k3s containers)
         if (spec.privileged()) {
             hostConfig.withPrivileged(true);
+        }
+        if (spec.labels() != null && "true".equals(spec.labels().get("floci.security-group-workload"))) {
+            hostConfig.withCapDrop(Capability.NET_ADMIN, Capability.NET_RAW);
         }
 
         if (spec.cgroupnsMode() != null && !spec.cgroupnsMode().isBlank()) {
