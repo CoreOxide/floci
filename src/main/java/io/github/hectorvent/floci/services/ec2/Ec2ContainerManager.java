@@ -43,6 +43,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -221,10 +222,13 @@ public class Ec2ContainerManager {
         String address = helper.getNetworkSettings().getNetworks().values().stream()
                 .map(network -> network.getIpAddress()).filter(ip -> ip != null && !ip.isBlank())
                 .findFirst().orElseThrow(() -> new IllegalStateException("EC2 firewall helper has no Docker IP"));
-        return new ProtectedNamespace(helperId, address);
+        String ipv6Address = helper.getNetworkSettings().getNetworks().values().stream()
+                .map(network -> network.getGlobalIPv6Address()).filter(ip -> ip != null && !ip.isBlank())
+                .findFirst().orElse(null);
+        return new ProtectedNamespace(helperId, address, ipv6Address);
     }
 
-    private record ProtectedNamespace(String helperId, String transportAddress) {}
+    private record ProtectedNamespace(String helperId, String transportAddress, String transportIpv6Address) {}
 
     public void restoreSecurityGroups(Instance instance, String region, List<SecurityGroup> groups,
                                       Map<String, List<String>> prefixLists) {
@@ -237,12 +241,18 @@ public class Ec2ContainerManager {
         }
         String helperId = namespace.helperId();
         String address = namespace.transportAddress();
+        instance.getPublishedPorts().values().forEach(portAllocator::markReserved);
         InstanceNetworkInterface eni = instance.getNetworkInterfaces().getFirst();
         String logical = instance.getLogicalPrivateIpAddress() != null
                 ? instance.getLogicalPrivateIpAddress() : eni.getPrivateIpAddress();
+        String logicalIpv6 = instance.getNetworkInterfaces().stream()
+                .flatMap(networkInterface -> networkInterface.getIpv6Addresses().stream())
+                .findFirst().orElse(null);
         firewallManager.register(new SecurityGroupNftCompiler.Endpoint(regionResolver.getAccountId(), region,
-                instance.getVpcId(), eni.getNetworkInterfaceId(), logical, address,
-                instance.getSecurityGroups().stream().map(GroupIdentifier::getGroupId)
+                instance.getVpcId(), eni.getNetworkInterfaceId(), logical, logicalIpv6, address,
+                namespace.transportIpv6Address(),
+                instance.getNetworkInterfaces().stream().flatMap(networkInterface -> networkInterface.getGroups().stream())
+                        .map(GroupIdentifier::getGroupId).distinct()
                         .collect(Collectors.toSet()), groups), helperId, prefixLists);
     }
 
@@ -365,7 +375,6 @@ public class Ec2ContainerManager {
 
     /**
      * @param appPorts TCP ports opened by the instance's security groups to publish on the host
-     *                 via socat sidecars once the container is running (empty for none)
      */
     public void launch(Instance instance, ResolvedAmiImage image, String publicKey, String region, Set<Integer> appPorts) {
         launch(instance, image, publicKey, region, appPorts, List.of(), Map.of());
@@ -403,7 +412,7 @@ public class Ec2ContainerManager {
                 String flociHost = dockerHostResolver.resolve();
                 int imdsPort = config.services().ec2().imdsPort();
                 StartedContainer started = createAndStartContainer(instance, image, region, flociHost, imdsPort,
-                        leasedPrivateIp, groups, prefixLists);
+                        leasedPrivateIp, appPorts, groups, prefixLists);
                 if (started == null) {
                     return;
                 }
@@ -501,8 +510,7 @@ public class Ec2ContainerManager {
                 configureLinkLocalMetadataEndpoint(started.namespace() == null
                         ? containerId : started.namespace().helperId(), instanceId, flociHost, imdsPort);
 
-                // Publish security-group TCP ingress ports on the host via socat sidecars.
-                if (appPorts != null && !appPorts.isEmpty()) {
+                if (started.namespace() == null && appPorts != null && !appPorts.isEmpty()) {
                     portForwardManager.reconcile(instance, appPorts);
                 }
 
@@ -547,6 +555,7 @@ public class Ec2ContainerManager {
 
     private StartedContainer createAndStartContainer(Instance instance, ResolvedAmiImage image, String region,
                                                      String flociHost, int imdsPort, String leasedPrivateIp,
+                                                     Set<Integer> appPorts,
                                                      List<SecurityGroup> groups,
                                                      Map<String, List<String>> prefixLists) {
         String instanceId = instance.getInstanceId();
@@ -573,11 +582,27 @@ public class Ec2ContainerManager {
                     InstanceNetworkInterface eni = instance.getNetworkInterfaces().getFirst();
                     eniId = eni.getNetworkInterfaceId();
                     instance.setLogicalPrivateIpAddress(eni.getPrivateIpAddress());
+                    Map<Integer, Integer> publishedPorts = new LinkedHashMap<>();
+                    publishedPorts.put(22, sshHostPort);
+                    if (appPorts != null) {
+                        for (Integer appPort : appPorts) {
+                            if (appPort != null && appPort > 0 && appPort <= 65535 && appPort != 22) {
+                                publishedPorts.put(appPort, 0);
+                            }
+                        }
+                    }
                     namespace = firewallManager.createNamespace("ec2", instanceId,
-                            regionResolver.getAccountId(), region, Optional.empty(), Map.of(22, sshHostPort));
+                            regionResolver.getAccountId(), region, Optional.empty(), publishedPorts);
+                    instance.getPublishedPorts().clear();
+                    namespace.publishedHostPorts().forEach((containerPort, hostPort) -> {
+                        if (containerPort != 22) {
+                            instance.getPublishedPorts().put(containerPort, hostPort);
+                        }
+                    });
                     firewallManager.register(new SecurityGroupNftCompiler.Endpoint(regionResolver.getAccountId(),
                             region, instance.getVpcId(), eniId, eni.getPrivateIpAddress(),
-                            namespace.transportAddress(),
+                            eni.getIpv6Addresses().stream().findFirst().orElse(null),
+                            namespace.transportAddress(), namespace.transportIpv6Address(),
                             instance.getSecurityGroups().stream().map(g -> g.getGroupId())
                                     .collect(Collectors.toSet()), groups),
                             namespace.helperId(), prefixLists);
@@ -893,9 +918,11 @@ public class Ec2ContainerManager {
         }
         instance.setState(InstanceState.stopping());
         executor.submit(() -> {
-            // Sidecars forward to the container's current IP, which Docker reassigns on the
-            // next start; tear them down so no forward is left pointing at a stale address.
-            portForwardManager.unpublishAll(instance);
+            if (firewallManager == null || !firewallManager.enabled()) {
+                // Sidecars forward to the container's current IP, which Docker reassigns on the
+                // next start; tear them down so no forward is left pointing at a stale address.
+                portForwardManager.unpublishAll(instance);
+            }
             try {
                 dockerClient.stopContainerCmd(containerId).withTimeout(30).exec();
             } catch (NotFoundException e) {

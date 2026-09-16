@@ -1,5 +1,8 @@
 package io.github.hectorvent.floci.services.ec2;
 
+import java.math.BigInteger;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -20,6 +23,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -189,6 +193,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
     private final Set<String> seededAccountRegions = ConcurrentHashMap.newKeySet();
     // subnetId → counter for IP assignment (runtime-only, not persisted)
     private final Map<String, AtomicInteger> subnetIpCounters = new ConcurrentHashMap<>();
+    private final Map<String, AtomicInteger> subnetIpv6Counters = new ConcurrentHashMap<>();
 
     /**
      * Null in the hermetic unit tests, which reach the constructors that do not take it; CDI always
@@ -2678,6 +2683,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                 eni.setMacAddress(suppliedEni != null ? suppliedEni.getMacAddress() : null);
                 eni.setPrivateIpAddress(privateIp);
                 eni.setPrivateDnsName(inst.getPrivateDnsName());
+                if (suppliedEni != null) {
+                    eni.setIpv6Addresses(new ArrayList<>(suppliedEni.getIpv6Addresses()));
+                } else if (subnet != null && subnet.isAssignIpv6AddressOnCreation()
+                        && !subnet.getIpv6CidrBlockAssociationSet().isEmpty()) {
+                    eni.setIpv6Addresses(List.of(assignIpv6(region, finalSubnetId)));
+                }
                 eni.setGroups(new ArrayList<>(sgIdentifiers));
                 eni.setAttachmentId("eni-attach-" + randomHex(17));
                 eni.setDeviceIndex(suppliedEni != null ? networkInterfaceDeviceIndex : 0);
@@ -2851,12 +2862,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
     }
 
     private void restoreInstanceFirewall(Instance instance) {
-        if (!securityGroupEnforcementEnabled()) {
+        if (!securityGroupEnforcementEnabled() || config.services().ec2().mock()
+                || instance.getDockerContainerId() == null) {
             return;
         }
         String region = instance.getRegion();
-        List<SecurityGroup> attached = instance.getSecurityGroups().stream()
-                .map(group -> getRequiredSecurityGroup(region, group.getGroupId())).toList();
+        List<SecurityGroup> attached = instance.getNetworkInterfaces().stream()
+                .flatMap(networkInterface -> networkInterface.getGroups().stream())
+                .map(GroupIdentifier::getGroupId).distinct()
+                .map(groupId -> getRequiredSecurityGroup(region, groupId)).toList();
         containerManager.restoreSecurityGroups(instance, region, attached, policyPrefixLists(region, attached));
     }
 
@@ -2973,6 +2987,47 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         String baseIp = cidr.split("/")[0];
         String[] parts = baseIp.split("\\.");
         return parts[0] + "." + parts[1] + "." + parts[2] + "." + offset;
+    }
+
+    private String assignIpv6(String region, String subnetId) {
+        Subnet subnet = requireSubnet(region, subnetId);
+        String cidr = subnet.getIpv6CidrBlockAssociationSet().stream()
+                .filter(association -> "associated".equals(association.getIpv6CidrBlockState()))
+                .map(VpcIpv6CidrBlockAssociation::getIpv6CidrBlock)
+                .filter(value -> value != null && !value.isBlank())
+                .findFirst()
+                .orElseThrow(() -> new AwsException("InvalidParameterValue",
+                        "Subnet '" + subnetId + "' has no associated IPv6 CIDR block", 400));
+        String[] parts = cidr.split("/", 2);
+        try {
+            byte[] base = InetAddress.getByName(parts[0]).getAddress();
+            if (base.length != 16) {
+                throw new UnknownHostException(cidr);
+            }
+            AtomicInteger counter = subnetIpv6Counters.computeIfAbsent(region + "::" + subnetId,
+                    ignored -> new AtomicInteger(10));
+            while (true) {
+                byte[] raw = new BigInteger(1, base).add(BigInteger.valueOf(counter.getAndIncrement())).toByteArray();
+                byte[] address = new byte[16];
+                System.arraycopy(raw, Math.max(0, raw.length - address.length), address,
+                        Math.max(0, address.length - raw.length), Math.min(raw.length, address.length));
+                String candidate = InetAddress.getByAddress(address).getHostAddress();
+                if (!ipv6AddressInUse(region, candidate)) {
+                    return candidate;
+                }
+            }
+        } catch (UnknownHostException e) {
+            throw new AwsException("InvalidParameterValue", "Invalid subnet IPv6 CIDR '" + cidr + "'", 400);
+        }
+    }
+
+    private boolean ipv6AddressInUse(String region, String address) {
+        String prefix = region + "::";
+        return networkInterfaces.scan(key -> key.startsWith(prefix)).stream()
+                .anyMatch(networkInterface -> networkInterface.getIpv6Addresses().contains(address))
+                || instances.scan(key -> key.startsWith(prefix)).stream()
+                .flatMap(instance -> instance.getNetworkInterfaces().stream())
+                .anyMatch(networkInterface -> networkInterface.getIpv6Addresses().contains(address));
     }
 
     public List<Reservation> describeInstances(String region, List<String> instanceIds, Map<String, List<String>> filters) {
@@ -7869,12 +7924,25 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
     public NetworkInterface createNetworkInterface(String region, String subnetId, String description,
                                                     String privateIpAddress, List<String> privateIpAddresses,
                                                     List<String> securityGroupIds, List<Tag> tagList) {
+        return createNetworkInterface(region, subnetId, description, privateIpAddress, privateIpAddresses,
+                List.of(), 0, securityGroupIds, tagList);
+    }
+
+    public NetworkInterface createNetworkInterface(String region, String subnetId, String description,
+                                                    String privateIpAddress, List<String> privateIpAddresses,
+                                                    List<String> ipv6Addresses, int ipv6AddressCount,
+                                                    List<String> securityGroupIds, List<Tag> tagList) {
         if (subnetId == null || subnetId.isBlank()) {
             throw new AwsException("MissingParameter",
                     "The request must contain the parameter SubnetId", 400);
         }
         ensureDefaultResources(region);
         Subnet subnet = requireSubnet(region, subnetId);
+        if (ipv6AddressCount < 0 || (ipv6Addresses != null && !ipv6Addresses.isEmpty()
+                && ipv6AddressCount > 0)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Specify either Ipv6Addresses or Ipv6AddressCount", 400);
+        }
 
         List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
         if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
@@ -7937,6 +8005,32 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         }
         ni.setPrivateIpAddresses(ipList);
 
+        LinkedHashSet<String> assignedIpv6 = new LinkedHashSet<>();
+        if (ipv6Addresses != null) {
+            for (String address : ipv6Addresses) {
+                if (address == null || address.isBlank()) {
+                    continue;
+                }
+                boolean inSubnet = subnet.getIpv6CidrBlockAssociationSet().stream()
+                        .filter(association -> "associated".equals(association.getIpv6CidrBlockState()))
+                        .anyMatch(association -> SecurityGroupPolicy.inCidr(address,
+                                association.getIpv6CidrBlock()));
+                if (!inSubnet) {
+                    throw new AwsException("InvalidParameterValue",
+                            "IPv6 address '" + address + "' is not in subnet '" + subnetId + "'", 400);
+                }
+                assignedIpv6.add(address);
+            }
+        }
+        int generatedCount = Math.max(0, ipv6AddressCount);
+        if (assignedIpv6.isEmpty() && generatedCount == 0 && subnet.isAssignIpv6AddressOnCreation()) {
+            generatedCount = 1;
+        }
+        for (int i = 0; i < generatedCount; i++) {
+            assignedIpv6.add(assignIpv6(region, subnetId));
+        }
+        ni.setIpv6Addresses(new ArrayList<>(assignedIpv6));
+
         networkInterfaces.put(key(region, eniId), ni);
         return ni;
     }
@@ -7949,6 +8043,86 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                     "Network interface '" + networkInterfaceId + "' is currently in use", 400);
         }
         networkInterfaces.delete(key(region, networkInterfaceId));
+    }
+
+    public void modifyNetworkInterfaceGroups(String region, String networkInterfaceId, List<String> groupIds) {
+        NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+        if (groupIds == null || groupIds.isEmpty()) {
+            throw new AwsException("InvalidParameterValue", "At least one security group is required", 400);
+        }
+        List<GroupIdentifier> groups = new ArrayList<>();
+        for (String groupId : groupIds) {
+            SecurityGroup group = getRequiredSecurityGroup(region, groupId);
+            if (!ni.getVpcId().equals(group.getVpcId())) {
+                throw new AwsException("InvalidGroup.NotFound",
+                        "Security group " + groupId + " does not belong to the network interface VPC", 400);
+            }
+            groups.add(new GroupIdentifier(group.getGroupId(), group.getGroupName()));
+        }
+        ni.setGroups(groups);
+        networkInterfaces.put(key(region, networkInterfaceId), ni);
+        updateAttachedNetworkInterface(region, ni, attached -> attached.setGroups(new ArrayList<>(groups)));
+    }
+
+    public List<String> assignIpv6Addresses(String region, String networkInterfaceId,
+                                            List<String> requested, int count) {
+        NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+        if (count < 0 || (requested != null && !requested.isEmpty() && count > 0)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Specify either Ipv6Address or Ipv6AddressCount", 400);
+        }
+        Subnet subnet = requireSubnet(region, ni.getSubnetId());
+        LinkedHashSet<String> assigned = new LinkedHashSet<>();
+        if (requested != null) {
+            for (String address : requested) {
+                if (address == null || address.isBlank()) {
+                    continue;
+                }
+                boolean inSubnet = subnet.getIpv6CidrBlockAssociationSet().stream()
+                        .anyMatch(association -> SecurityGroupPolicy.inCidr(address,
+                                association.getIpv6CidrBlock()));
+                if (!inSubnet) {
+                    throw new AwsException("InvalidParameterValue",
+                            "IPv6 address '" + address + "' is not in subnet '" + ni.getSubnetId() + "'", 400);
+                }
+                assigned.add(address);
+            }
+        }
+        for (int i = 0; i < Math.max(0, count); i++) {
+            assigned.add(assignIpv6(region, ni.getSubnetId()));
+        }
+        ni.getIpv6Addresses().addAll(assigned.stream()
+                .filter(address -> !ni.getIpv6Addresses().contains(address)).toList());
+        networkInterfaces.put(key(region, networkInterfaceId), ni);
+        updateAttachedNetworkInterface(region, ni,
+                attached -> attached.setIpv6Addresses(new ArrayList<>(ni.getIpv6Addresses())));
+        return new ArrayList<>(assigned);
+    }
+
+    public List<String> unassignIpv6Addresses(String region, String networkInterfaceId, List<String> addresses) {
+        NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+        List<String> removed = addresses == null ? List.of() : addresses.stream()
+                .filter(ni.getIpv6Addresses()::contains).distinct().toList();
+        ni.getIpv6Addresses().removeAll(removed);
+        networkInterfaces.put(key(region, networkInterfaceId), ni);
+        updateAttachedNetworkInterface(region, ni,
+                attached -> attached.setIpv6Addresses(new ArrayList<>(ni.getIpv6Addresses())));
+        return removed;
+    }
+
+    private void updateAttachedNetworkInterface(String region, NetworkInterface ni,
+                                                Consumer<InstanceNetworkInterface> update) {
+        if (ni.getAttachment() == null) {
+            return;
+        }
+        Instance instance = getRequiredInstance(region, ni.getAttachment().getInstanceId());
+        instance.getNetworkInterfaces().stream()
+                .filter(attached -> ni.getNetworkInterfaceId().equals(attached.getNetworkInterfaceId()))
+                .findFirst().ifPresent(update);
+        instance.getNetworkInterfaces().stream().filter(attached -> attached.getDeviceIndex() == 0)
+                .findFirst().ifPresent(primary -> instance.setSecurityGroups(new ArrayList<>(primary.getGroups())));
+        instances.put(key(region, instance.getInstanceId()), instance);
+        restoreInstanceFirewall(instance);
     }
 
     /**
@@ -8001,12 +8175,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         attached.setMacAddress(ni.getMacAddress());
         attached.setPrivateIpAddress(ni.getPrivateIpAddress());
         attached.setPrivateDnsName(ni.getPrivateDnsName());
+        attached.setIpv6Addresses(new ArrayList<>(ni.getIpv6Addresses()));
         attached.setGroups(new ArrayList<>(ni.getGroups()));
         attached.setAttachmentId(attachment.getAttachmentId());
         attached.setDeviceIndex(deviceIndex);
         attached.setAttachTime(attachment.getAttachTime());
         inst.getNetworkInterfaces().add(attached);
         instances.put(key(region, instanceId), inst);
+        restoreInstanceFirewall(inst);
         return attachment;
     }
 
@@ -8025,6 +8201,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         ni.setStatus("available");
         networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
         detachFromInstance(region, detached.getInstanceId(), ni.getNetworkInterfaceId());
+        Instance instance = instances.get(key(region, detached.getInstanceId())).orElse(null);
+        if (instance != null) {
+            restoreInstanceFirewall(instance);
+        }
         return detached;
     }
 

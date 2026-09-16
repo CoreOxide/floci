@@ -42,6 +42,7 @@ import io.github.hectorvent.floci.services.ec2.model.TransitGatewayRouteTablePro
 import io.github.hectorvent.floci.services.ec2.model.TransitGatewayVpcAttachment;
 import io.github.hectorvent.floci.services.ec2.model.TransitGatewayVpcAttachmentOptions;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
+import io.github.hectorvent.floci.services.ec2.model.VpcIpv6CidrBlockAssociation;
 import io.github.hectorvent.floci.services.ec2.model.VpcEndpoint;
 import io.github.hectorvent.floci.services.ec2.model.VpcEndpointSubnetConfiguration;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
@@ -220,6 +221,32 @@ class Ec2ServiceTest {
 
         assertTrue(matched.stream()
                 .anyMatch(n -> eni.getNetworkInterfaceId().equals(n.getNetworkInterfaceId())));
+    }
+
+    @Test
+    void networkInterfaceIpv6AddressesFollowTheSubnetAssociation() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        Vpc vpc = service.describeVpcs("us-east-1", List.of(), Map.of()).getFirst();
+        VpcIpv6CidrBlockAssociation association = service.associateAmazonProvidedIpv6CidrBlock(
+                "us-east-1", vpc.getVpcId());
+        Subnet subnet = service.createSubnet("us-east-1", vpc.getVpcId(), "10.77.0.0/24", null,
+                null, association.getIpv6CidrBlock());
+
+        NetworkInterface eni = service.createNetworkInterface("us-east-1", subnet.getSubnetId(), null,
+                null, List.of(), List.of(), 2, List.of(), List.of());
+
+        assertEquals(2, eni.getIpv6Addresses().size());
+        assertTrue(eni.getIpv6Addresses().stream()
+                .allMatch(address -> SecurityGroupPolicy.inCidr(address, association.getIpv6CidrBlock())));
+        List<String> removed = service.unassignIpv6Addresses("us-east-1", eni.getNetworkInterfaceId(),
+                List.of(eni.getIpv6Addresses().getFirst()));
+        assertEquals(1, removed.size());
+        assertEquals(1, eni.getIpv6Addresses().size());
+        assertEquals("InvalidParameterValue", assertThrows(AwsException.class,
+                () -> service.assignIpv6Addresses("us-east-1", eni.getNetworkInterfaceId(),
+                        List.of("2001:db8::1"), 0)).getErrorCode());
     }
 
     @Test

@@ -257,6 +257,9 @@ public class Ec2QueryHandler {
                 case "DeleteNetworkInterface" -> handleDeleteNetworkInterface(params, region);
                 case "AttachNetworkInterface" -> handleAttachNetworkInterface(params, region);
                 case "DetachNetworkInterface" -> handleDetachNetworkInterface(params, region);
+                case "ModifyNetworkInterfaceAttribute" -> handleModifyNetworkInterfaceAttribute(params, region);
+                case "AssignIpv6Addresses" -> handleAssignIpv6Addresses(params, region);
+                case "UnassignIpv6Addresses" -> handleUnassignIpv6Addresses(params, region);
                 // Volumes
                 case "CreateVolume" -> handleCreateVolume(params, region);
                 case "DescribeVolumes" -> handleDescribeVolumes(params, region);
@@ -4268,6 +4271,13 @@ public class Ec2QueryHandler {
             }
             xml.end("privateIpAddressesSet");
         }
+        if (!ni.getIpv6Addresses().isEmpty()) {
+            xml.start("ipv6AddressesSet");
+            for (String address : ni.getIpv6Addresses()) {
+                xml.start("item").elem("ipv6Address", address).end("item");
+            }
+            xml.end("ipv6AddressesSet");
+        }
         return xml.build();
     }
 
@@ -4283,6 +4293,15 @@ public class Ec2QueryHandler {
             }
             privateIpAddresses.add(addr);
         }
+        List<String> ipv6Addresses = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String address = p.getFirst("Ipv6Addresses." + i + ".Ipv6Address");
+            if (address == null) {
+                break;
+            }
+            ipv6Addresses.add(address);
+        }
+        int ipv6AddressCount = parseIntParam(p, "Ipv6AddressCount", 0);
         List<String> securityGroupIds = getList(p, "SecurityGroupId");
         if (securityGroupIds.isEmpty()) {
             securityGroupIds = getList(p, "Groups.SecurityGroupId");
@@ -4290,7 +4309,8 @@ public class Ec2QueryHandler {
         List<Tag> tagList = parseTagsForResource(p, "network-interface");
 
         NetworkInterface ni = service.createNetworkInterface(region, subnetId, description,
-                privateIpAddress, privateIpAddresses, securityGroupIds, tagList);
+                privateIpAddress, privateIpAddresses, ipv6Addresses, ipv6AddressCount,
+                securityGroupIds, tagList);
 
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateNetworkInterfaceResponse", AwsNamespaces.EC2)
@@ -4303,6 +4323,43 @@ public class Ec2QueryHandler {
     private Response handleDeleteNetworkInterface(MultivaluedMap<String, String> p, String region) {
         service.deleteNetworkInterface(region, p.getFirst("NetworkInterfaceId"));
         return booleanResponse("DeleteNetworkInterface");
+    }
+
+    private Response handleModifyNetworkInterfaceAttribute(MultivaluedMap<String, String> p, String region) {
+        List<String> groupIds = getList(p, "GroupId");
+        if (groupIds.isEmpty()) {
+            groupIds = getList(p, "GroupSet");
+        }
+        service.modifyNetworkInterfaceGroups(region, p.getFirst("NetworkInterfaceId"), groupIds);
+        return booleanResponse("ModifyNetworkInterfaceAttribute");
+    }
+
+    private Response handleAssignIpv6Addresses(MultivaluedMap<String, String> p, String region) {
+        List<String> addresses = getList(p, "Ipv6Address");
+        int count = parseIntParam(p, "Ipv6AddressCount", 0);
+        List<String> assigned = service.assignIpv6Addresses(region, p.getFirst("NetworkInterfaceId"),
+                addresses, count);
+        XmlBuilder xml = new XmlBuilder()
+                .start("AssignIpv6AddressesResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("networkInterfaceId", p.getFirst("NetworkInterfaceId"))
+                .start("assignedIpv6Addresses");
+        assigned.forEach(address -> xml.elem("item", address));
+        xml.end("assignedIpv6Addresses").end("AssignIpv6AddressesResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleUnassignIpv6Addresses(MultivaluedMap<String, String> p, String region) {
+        List<String> removed = service.unassignIpv6Addresses(region, p.getFirst("NetworkInterfaceId"),
+                getList(p, "Ipv6Address"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("UnassignIpv6AddressesResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("networkInterfaceId", p.getFirst("NetworkInterfaceId"))
+                .start("unassignedIpv6Addresses");
+        removed.forEach(address -> xml.elem("item", address));
+        xml.end("unassignedIpv6Addresses").end("UnassignIpv6AddressesResponse");
+        return xmlResponse(xml.build());
     }
 
     private Response handleAttachNetworkInterface(MultivaluedMap<String, String> p, String region) {
@@ -4408,8 +4465,15 @@ public class Ec2QueryHandler {
                     .elem("privateDnsName", eni.getPrivateDnsName())
                     .elem("primary", "true")
                     .end("item")
-                    .end("privateIpAddressesSet")
-                    .end("item");
+                    .end("privateIpAddressesSet");
+            if (!eni.getIpv6Addresses().isEmpty()) {
+                xml.start("ipv6AddressesSet");
+                for (String address : eni.getIpv6Addresses()) {
+                    xml.start("item").elem("ipv6Address", address).end("item");
+                }
+                xml.end("ipv6AddressesSet");
+            }
+            xml.end("item");
         }
         xml.end("networkInterfaceSet");
         xml.elem("clientToken", inst.getClientToken());

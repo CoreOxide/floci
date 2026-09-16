@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -18,12 +19,23 @@ public final class SecurityGroupNftCompiler {
     private SecurityGroupNftCompiler() {}
 
     public record Endpoint(String accountId, String region, String vpcId, String eniId,
-                           String logicalAddress, String transportAddress, Set<String> groupIds,
-                           List<SecurityGroup> groups) {
-        SecurityGroupPolicy.Peer peer() {
-            return new SecurityGroupPolicy.Peer(logicalAddress, accountId, vpcId, groupIds);
+                           String logicalAddress, String logicalIpv6Address,
+                           String transportAddress, String transportIpv6Address,
+                           Set<String> groupIds, List<SecurityGroup> groups) {
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups) {
+            this(accountId, region, vpcId, eniId, logicalAddress, null,
+                    transportAddress, null, groupIds, groups);
+        }
+
+        SecurityGroupPolicy.Peer peer(String address) {
+            return new SecurityGroupPolicy.Peer(address, accountId, vpcId, groupIds);
         }
     }
+
+    private record AddressIdentity(String logical, String transport) {}
 
     public static String initialRuleset() {
         return "add table inet floci_sg\n"
@@ -52,7 +64,6 @@ public final class SecurityGroupNftCompiler {
 
         List<Endpoint> managed = peers == null ? List.of() : peers.stream()
                 .filter(peer -> !target.eniId().equals(peer.eniId()))
-                .filter(peer -> peer.transportAddress() != null && literal(peer.transportAddress()))
                 .toList();
 
         for (boolean egress : new boolean[]{false, true}) {
@@ -70,11 +81,14 @@ public final class SecurityGroupNftCompiler {
                         continue;
                     }
                     for (Endpoint peer : managed) {
-                        if (target.accountId().equals(peer.accountId())
-                                && target.region().equals(peer.region())
-                                && target.vpcId().equals(peer.vpcId())
-                                && SecurityGroupPolicy.matchesPeer(group, permission, peer.peer(), prefixLists)) {
-                            appendRule(rules, chain, addressField, peer.transportAddress(), protocol);
+                        if (!sameScope(target, peer)) {
+                            continue;
+                        }
+                        for (AddressIdentity identity : identities(peer)) {
+                            if (SecurityGroupPolicy.matchesPeer(group, permission,
+                                    peer.peer(identity.logical()), prefixLists)) {
+                                appendRule(rules, chain, addressField, identity.transport(), protocol);
+                            }
                         }
                     }
                 }
@@ -82,7 +96,9 @@ public final class SecurityGroupNftCompiler {
             // A managed peer must never fall through to a broad external CIDR rule
             // evaluated against its Docker bridge IP instead of its logical ENI address.
             for (Endpoint peer : managed) {
-                appendRule(rules, chain, addressField, peer.transportAddress(), "drop");
+                for (AddressIdentity identity : identities(peer)) {
+                    appendRule(rules, chain, addressField, identity.transport(), "drop");
+                }
             }
             for (SecurityGroup group : target.groups()) {
                 List<IpPermission> permissions = egress
@@ -115,6 +131,26 @@ public final class SecurityGroupNftCompiler {
             }
         }
         return rules.toString();
+    }
+
+    private static boolean sameScope(Endpoint target, Endpoint peer) {
+        return target.accountId().equals(peer.accountId())
+                && target.region().equals(peer.region())
+                && target.vpcId().equals(peer.vpcId());
+    }
+
+    private static List<AddressIdentity> identities(Endpoint endpoint) {
+        List<AddressIdentity> identities = new ArrayList<>(2);
+        addIdentity(identities, endpoint.logicalAddress(), endpoint.transportAddress());
+        addIdentity(identities, endpoint.logicalIpv6Address(), endpoint.transportIpv6Address() != null
+                ? endpoint.transportIpv6Address() : endpoint.transportAddress());
+        return identities;
+    }
+
+    private static void addIdentity(List<AddressIdentity> identities, String logical, String transport) {
+        if (logical != null && literal(logical) && transport != null && literal(transport)) {
+            identities.add(new AddressIdentity(logical, transport));
+        }
     }
 
     private static void appendRule(StringBuilder rules, String chain, String addressField,
