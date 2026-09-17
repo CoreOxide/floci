@@ -103,7 +103,7 @@ class SecurityGroupNftCompilerTest {
     }
 
     @Test
-    void managedIpv6IdentityFallsBackToIpv4DockerTransport() {
+    void ipv6OnlyPermissionNeverAllowsThePeersIpv4Transport() {
         SecurityGroup group = new SecurityGroup();
         group.setVpcId("vpc-1");
         group.setOwnerId("000000000000");
@@ -125,7 +125,11 @@ class SecurityGroupNftCompilerTest {
 
         String nft = SecurityGroupNftCompiler.compile(target, List.of(peer), Map.of());
 
-        assertTrue(nft.contains("ip saddr 172.17.0.3 udp dport 53 accept"));
+        // Only the peer's IPv6 range is authorized, and neither endpoint has an IPv6 transport, so
+        // the peer is unreachable rather than reachable over IPv4 the permission never allowed. The
+        // peer's logical IPv4 address is outside the range, so the identity carries no permission.
+        assertFalse(nft.contains("ip saddr 172.17.0.3 udp dport 53 accept"));
+        assertTrue(nft.contains("ip saddr 172.17.0.3 drop"));
     }
 
     private static SecurityGroupNftCompiler.Endpoint endpoint(String eni, String logical,

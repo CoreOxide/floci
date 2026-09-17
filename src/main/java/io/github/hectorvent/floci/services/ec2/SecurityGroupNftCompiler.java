@@ -152,8 +152,9 @@ public final class SecurityGroupNftCompiler {
     private static List<AddressIdentity> identities(Endpoint endpoint) {
         List<AddressIdentity> identities = new ArrayList<>(2);
         addIdentity(identities, endpoint.logicalAddress(), endpoint.transportAddress());
-        addIdentity(identities, endpoint.logicalIpv6Address(), endpoint.transportIpv6Address() != null
-                ? endpoint.transportIpv6Address() : endpoint.transportAddress());
+        // No IPv4 fallback: a rule authorizing only the peer's IPv6 range must never be emitted
+        // against its IPv4 transport address, that would allow v4 traffic no permission allows.
+        addIdentity(identities, endpoint.logicalIpv6Address(), endpoint.transportIpv6Address());
         return identities;
     }
 

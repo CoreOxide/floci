@@ -249,6 +249,56 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void modifyNetworkInterfaceGroupsReachesAnInstancesImplicitInterface() {
+        // RunInstances mints its own primary interface and never writes it to the standalone store,
+        // so it is the most common ENI in the account and the only one Terraform's
+        // aws_network_interface_sg_attachment normally targets.
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(enforcingConfig(), containerManager,
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        Reservation reservation = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null);
+        Instance instance = reservation.getInstances().getFirst();
+        String eniId = instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        String vpcId = instance.getNetworkInterfaces().getFirst().getVpcId();
+        SecurityGroup locked = service.createSecurityGroup("us-east-1", "locked", "locked down", vpcId);
+
+        service.modifyNetworkInterfaceGroups("us-east-1", eniId, List.of(locked.getGroupId()));
+
+        assertEquals(List.of(locked.getGroupId()), instance.getNetworkInterfaces().getFirst().getGroups()
+                .stream().map(GroupIdentifier::getGroupId).toList());
+        // The primary interface's groups are the instance's groups, so DescribeInstances must agree.
+        assertEquals(List.of(locked.getGroupId()), instance.getSecurityGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+        verify(containerManager).updateSecurityGroups(eq(eniId), eq(Set.of(locked.getGroupId())),
+                any(), any());
+    }
+
+    @Test
+    void modifyNetworkInterfaceAttributeWithoutGroupsIsNotARejectedGroupChange() {
+        // ModifyNetworkInterfaceAttribute carries one attribute per call, and Terraform sends
+        // Description and SourceDestCheck through it far more often than a group list.
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String subnetId = service.describeSubnets("us-east-1", List.of(), Map.of())
+                .getFirst().getSubnetId();
+        NetworkInterface eni = service.createNetworkInterface("us-east-1", subnetId, null,
+                null, List.of(), List.of(), List.of());
+
+        service.modifyNetworkInterfaceAttributes("us-east-1", eni.getNetworkInterfaceId(),
+                "routed by the appliance", false, null);
+
+        NetworkInterface stored = service.describeNetworkInterfaces("us-east-1",
+                List.of(eni.getNetworkInterfaceId()), Map.of(), 0, null).networkInterfaces().getFirst();
+        assertEquals("routed by the appliance", stored.getDescription());
+        assertFalse(stored.isSourceDestCheck());
+        assertThrows(AwsException.class, () -> service.modifyNetworkInterfaceAttributes("us-east-1",
+                "eni-doesnotexist00", "x", null, null));
+    }
+
+    @Test
     void networkInterfaceIpv6AddressesFollowTheSubnetAssociation() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),

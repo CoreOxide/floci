@@ -4332,11 +4332,21 @@ public class Ec2QueryHandler {
     }
 
     private Response handleModifyNetworkInterfaceAttribute(MultivaluedMap<String, String> p, String region) {
+        String networkInterfaceId = p.getFirst("NetworkInterfaceId");
         List<String> groupIds = getList(p, "GroupId");
         if (groupIds.isEmpty()) {
             groupIds = getList(p, "GroupSet");
         }
-        service.modifyNetworkInterfaceGroups(region, p.getFirst("NetworkInterfaceId"), groupIds);
+        // One call carries one attribute, and a group change is only one of them. Terraform sends
+        // Description, SourceDestCheck and Attachment.DeleteOnTermination through this same action,
+        // so a group list is absent far more often than not.
+        if (!groupIds.isEmpty()) {
+            service.modifyNetworkInterfaceGroups(region, networkInterfaceId, groupIds);
+        }
+        service.modifyNetworkInterfaceAttributes(region, networkInterfaceId,
+                p.getFirst("Description.Value"),
+                boolParam(p, "SourceDestCheck.Value"),
+                boolParam(p, "Attachment.DeleteOnTermination"));
         return booleanResponse("ModifyNetworkInterfaceAttribute");
     }
 

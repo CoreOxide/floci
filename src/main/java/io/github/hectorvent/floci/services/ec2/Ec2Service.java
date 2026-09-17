@@ -8089,15 +8089,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
     }
 
     public void modifyNetworkInterfaceGroups(String region, String networkInterfaceId, List<String> groupIds) {
-        NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+        InterfaceHandle handle = requireNetworkInterface(region, networkInterfaceId);
         if (groupIds == null || groupIds.isEmpty()) {
             throw new AwsException("InvalidParameterValue", "At least one security group is required", 400);
         }
-        List<GroupIdentifier> groups = resolveGroupsInVpc(region, ni.getVpcId(), groupIds, "network interface");
-        ni.setGroups(groups);
-        networkInterfaces.put(key(region, networkInterfaceId), ni);
-        Instance instance = updateAttachedNetworkInterface(region, ni,
-                attached -> attached.setGroups(new ArrayList<>(groups)));
+        List<GroupIdentifier> groups = resolveGroupsInVpc(region, handle.vpcId(), groupIds, "network interface");
+        handle.setGroups(groups);
+        Instance instance = persistNetworkInterface(region, handle);
         if (instance != null) {
             instance.getNetworkInterfaces().stream().filter(attached -> attached.getDeviceIndex() == 0)
                     .findFirst()
@@ -8109,9 +8107,35 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         updateNetworkInterfaceFirewall(region, networkInterfaceId, groupIds);
     }
 
+    /**
+     * Applies the ModifyNetworkInterfaceAttribute fields that are not the security group list. Each
+     * one is null when the request did not carry it, so a group-only call reaches here as a no-op
+     * that still validates the interface id.
+     */
+    public void modifyNetworkInterfaceAttributes(String region, String networkInterfaceId, String description,
+                                                 Boolean sourceDestCheck, Boolean deleteOnTermination) {
+        InterfaceHandle handle = requireNetworkInterface(region, networkInterfaceId);
+        if (description == null && sourceDestCheck == null && deleteOnTermination == null) {
+            return;
+        }
+        if (description != null) {
+            handle.setDescription(description);
+        }
+        if (sourceDestCheck != null) {
+            handle.setSourceDestCheck(sourceDestCheck);
+        }
+        // Only a standalone record carries an attachment whose deleteOnTermination can differ from
+        // the default: an implicit primary interface always dies with its instance.
+        if (deleteOnTermination != null && handle.standalone() != null
+                && handle.standalone().getAttachment() != null) {
+            handle.standalone().getAttachment().setDeleteOnTermination(deleteOnTermination);
+        }
+        persistNetworkInterface(region, handle);
+    }
+
     public List<String> assignIpv6Addresses(String region, String networkInterfaceId,
                                             List<String> requested, Integer count) {
-        NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+        InterfaceHandle handle = requireNetworkInterface(region, networkInterfaceId);
         boolean hasRequested = requested != null && !requested.isEmpty();
         if (count == null && !hasRequested) {
             throw new AwsException("MissingParameter",
@@ -8122,28 +8146,28 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
             throw new AwsException("InvalidParameterCombination",
                     "Specify either Ipv6Address or Ipv6AddressCount", 400);
         }
-        Subnet subnet = requireSubnet(region, ni.getSubnetId());
+        Subnet subnet = requireSubnet(region, handle.subnetId());
         LinkedHashSet<String> assigned = requestedIpv6InSubnet(subnet, requested);
-        assigned.addAll(assignIpv6(region, ni.getSubnetId(), requestedCount));
+        assigned.addAll(assignIpv6(region, handle.subnetId(), requestedCount));
         List<String> newlyAssigned = assigned.stream()
-                .filter(address -> !ni.getIpv6Addresses().contains(address)).toList();
+                .filter(address -> !handle.ipv6Addresses().contains(address)).toList();
         if (newlyAssigned.isEmpty()) {
             return newlyAssigned;
         }
-        ni.getIpv6Addresses().addAll(newlyAssigned);
-        persistIpv6Change(region, ni);
+        handle.ipv6Addresses().addAll(newlyAssigned);
+        persistIpv6Change(region, handle);
         return newlyAssigned;
     }
 
     public List<String> unassignIpv6Addresses(String region, String networkInterfaceId, List<String> addresses) {
-        NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+        InterfaceHandle handle = requireNetworkInterface(region, networkInterfaceId);
         List<String> removed = addresses == null ? List.of() : addresses.stream()
-                .filter(ni.getIpv6Addresses()::contains).distinct().toList();
+                .filter(handle.ipv6Addresses()::contains).distinct().toList();
         if (removed.isEmpty()) {
             return removed;
         }
-        ni.getIpv6Addresses().removeAll(removed);
-        persistIpv6Change(region, ni);
+        handle.ipv6Addresses().removeAll(removed);
+        persistIpv6Change(region, handle);
         return removed;
     }
 
@@ -8151,13 +8175,97 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
      * Stores an ENI whose IPv6 addresses changed and re-registers the firewall of the instance it
      * is attached to, because a managed IPv6 identity is part of the compiled policy.
      */
-    private void persistIpv6Change(String region, NetworkInterface ni) {
-        networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
-        Instance instance = updateAttachedNetworkInterface(region, ni,
-                attached -> attached.setIpv6Addresses(new ArrayList<>(ni.getIpv6Addresses())));
+    private void persistIpv6Change(String region, InterfaceHandle handle) {
+        Instance instance = persistNetworkInterface(region, handle);
         if (instance != null) {
             restoreInstanceFirewall(instance);
         }
+    }
+
+    /**
+     * A live ENI on whichever side owns it. The primary interface RunInstances mints for itself is
+     * never written to the standalone store, so every modification path has to reach the copy that
+     * lives on the instance record instead, or it answers NotFound for the most common ENI there is.
+     */
+    private record InterfaceHandle(NetworkInterface standalone, Instance instance,
+                                   InstanceNetworkInterface attached) {
+
+        String vpcId() {
+            return standalone != null ? standalone.getVpcId() : attached.getVpcId();
+        }
+
+        String subnetId() {
+            return standalone != null ? standalone.getSubnetId() : attached.getSubnetId();
+        }
+
+        /** The live list, so callers add and remove in place on either side. */
+        List<String> ipv6Addresses() {
+            return standalone != null ? standalone.getIpv6Addresses() : attached.getIpv6Addresses();
+        }
+
+        void setGroups(List<GroupIdentifier> groups) {
+            if (standalone != null) {
+                standalone.setGroups(groups);
+            } else {
+                attached.setGroups(groups);
+            }
+        }
+
+        void setDescription(String description) {
+            if (standalone != null) {
+                standalone.setDescription(description);
+            } else {
+                attached.setDescription(description);
+            }
+        }
+
+        void setSourceDestCheck(boolean sourceDestCheck) {
+            if (standalone != null) {
+                standalone.setSourceDestCheck(sourceDestCheck);
+            } else {
+                attached.setSourceDestCheck(sourceDestCheck);
+            }
+        }
+    }
+
+    /** Resolves an ENI for modification, standalone record first, then any live instance's own copy. */
+    private InterfaceHandle requireNetworkInterface(String region, String networkInterfaceId) {
+        NetworkInterface standalone = networkInterfaces.get(key(region, networkInterfaceId)).orElse(null);
+        if (standalone != null) {
+            return new InterfaceHandle(releaseIfHostIsGone(region, standalone), null, null);
+        }
+        String prefix = region + "::";
+        for (Instance inst : instances.scan(k -> k.startsWith(prefix))) {
+            if (inst.getState() != null && "terminated".equals(inst.getState().getName())) {
+                continue;
+            }
+            for (InstanceNetworkInterface attached : inst.getNetworkInterfaces()) {
+                if (networkInterfaceId.equals(attached.getNetworkInterfaceId())) {
+                    return new InterfaceHandle(null, inst, attached);
+                }
+            }
+        }
+        throw new AwsException("InvalidNetworkInterfaceID.NotFound",
+                "The network interface ID '" + networkInterfaceId + "' does not exist", 400);
+    }
+
+    /**
+     * Writes a modified ENI back to its owning store and mirrors it onto the instance holding it.
+     * Returns that instance, or null when the interface is unattached.
+     */
+    private Instance persistNetworkInterface(String region, InterfaceHandle handle) {
+        if (handle.standalone() == null) {
+            instances.put(key(region, handle.instance().getInstanceId()), handle.instance());
+            return handle.instance();
+        }
+        NetworkInterface ni = handle.standalone();
+        networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
+        return updateAttachedNetworkInterface(region, ni, attached -> {
+            attached.setGroups(new ArrayList<>(ni.getGroups()));
+            attached.setIpv6Addresses(new ArrayList<>(ni.getIpv6Addresses()));
+            attached.setDescription(ni.getDescription());
+            attached.setSourceDestCheck(ni.isSourceDestCheck());
+        });
     }
 
     /** Mirrors an ENI change onto the instance holding it. Returns null when nothing is attached. */
