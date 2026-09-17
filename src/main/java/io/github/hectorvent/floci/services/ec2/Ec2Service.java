@@ -7925,12 +7925,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                                                     String privateIpAddress, List<String> privateIpAddresses,
                                                     List<String> securityGroupIds, List<Tag> tagList) {
         return createNetworkInterface(region, subnetId, description, privateIpAddress, privateIpAddresses,
-                List.of(), 0, securityGroupIds, tagList);
+                List.of(), null, securityGroupIds, tagList);
     }
 
+    /**
+     * @param ipv6AddressCount {@code null} when the request omits it, which lets the subnet's
+     *     {@code AssignIpv6AddressOnCreation} apply; an explicit {@code 0} overrides that setting
+     *     and assigns no IPv6 address.
+     */
     public NetworkInterface createNetworkInterface(String region, String subnetId, String description,
                                                     String privateIpAddress, List<String> privateIpAddresses,
-                                                    List<String> ipv6Addresses, int ipv6AddressCount,
+                                                    List<String> ipv6Addresses, Integer ipv6AddressCount,
                                                     List<String> securityGroupIds, List<Tag> tagList) {
         if (subnetId == null || subnetId.isBlank()) {
             throw new AwsException("MissingParameter",
@@ -7938,8 +7943,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         }
         ensureDefaultResources(region);
         Subnet subnet = requireSubnet(region, subnetId);
-        if (ipv6AddressCount < 0 || (ipv6Addresses != null && !ipv6Addresses.isEmpty()
-                && ipv6AddressCount > 0)) {
+        int requestedIpv6Count = ipv6AddressCount == null ? 0 : ipv6AddressCount;
+        if (requestedIpv6Count < 0 || (ipv6Addresses != null && !ipv6Addresses.isEmpty()
+                && requestedIpv6Count > 0)) {
             throw new AwsException("InvalidParameterCombination",
                     "Specify either Ipv6Addresses or Ipv6AddressCount", 400);
         }
@@ -8022,8 +8028,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                 assignedIpv6.add(address);
             }
         }
-        int generatedCount = Math.max(0, ipv6AddressCount);
-        if (assignedIpv6.isEmpty() && generatedCount == 0 && subnet.isAssignIpv6AddressOnCreation()) {
+        int generatedCount = requestedIpv6Count;
+        if (assignedIpv6.isEmpty() && ipv6AddressCount == null && subnet.isAssignIpv6AddressOnCreation()) {
             generatedCount = 1;
         }
         for (int i = 0; i < generatedCount; i++) {
@@ -8065,9 +8071,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
     }
 
     public List<String> assignIpv6Addresses(String region, String networkInterfaceId,
-                                            List<String> requested, int count) {
+                                            List<String> requested, Integer count) {
         NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
-        if (count < 0 || (requested != null && !requested.isEmpty() && count > 0)) {
+        boolean hasRequested = requested != null && !requested.isEmpty();
+        if (count == null && !hasRequested) {
+            throw new AwsException("MissingParameter",
+                    "Either Ipv6Addresses or Ipv6AddressCount is required", 400);
+        }
+        int requestedCount = count == null ? 0 : count;
+        if (requestedCount < 0 || (hasRequested && requestedCount > 0)) {
             throw new AwsException("InvalidParameterCombination",
                     "Specify either Ipv6Address or Ipv6AddressCount", 400);
         }
@@ -8088,15 +8100,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                 assigned.add(address);
             }
         }
-        for (int i = 0; i < Math.max(0, count); i++) {
+        for (int i = 0; i < requestedCount; i++) {
             assigned.add(assignIpv6(region, ni.getSubnetId()));
         }
-        ni.getIpv6Addresses().addAll(assigned.stream()
-                .filter(address -> !ni.getIpv6Addresses().contains(address)).toList());
+        List<String> newlyAssigned = assigned.stream()
+                .filter(address -> !ni.getIpv6Addresses().contains(address)).toList();
+        ni.getIpv6Addresses().addAll(newlyAssigned);
         networkInterfaces.put(key(region, networkInterfaceId), ni);
         updateAttachedNetworkInterface(region, ni,
                 attached -> attached.setIpv6Addresses(new ArrayList<>(ni.getIpv6Addresses())));
-        return new ArrayList<>(assigned);
+        return newlyAssigned;
     }
 
     public List<String> unassignIpv6Addresses(String region, String networkInterfaceId, List<String> addresses) {

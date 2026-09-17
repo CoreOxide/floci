@@ -4301,7 +4301,7 @@ public class Ec2QueryHandler {
             }
             ipv6Addresses.add(address);
         }
-        int ipv6AddressCount = parseIntParam(p, "Ipv6AddressCount", 0);
+        Integer ipv6AddressCount = intParam(p, "Ipv6AddressCount");
         List<String> securityGroupIds = getList(p, "SecurityGroupId");
         if (securityGroupIds.isEmpty()) {
             securityGroupIds = getList(p, "Groups.SecurityGroupId");
@@ -4335,8 +4335,8 @@ public class Ec2QueryHandler {
     }
 
     private Response handleAssignIpv6Addresses(MultivaluedMap<String, String> p, String region) {
-        List<String> addresses = getList(p, "Ipv6Address");
-        int count = parseIntParam(p, "Ipv6AddressCount", 0);
+        List<String> addresses = getList(p, "Ipv6Addresses", "Ipv6Address");
+        Integer count = intParam(p, "Ipv6AddressCount");
         List<String> assigned = service.assignIpv6Addresses(region, p.getFirst("NetworkInterfaceId"),
                 addresses, count);
         XmlBuilder xml = new XmlBuilder()
@@ -4351,7 +4351,7 @@ public class Ec2QueryHandler {
 
     private Response handleUnassignIpv6Addresses(MultivaluedMap<String, String> p, String region) {
         List<String> removed = service.unassignIpv6Addresses(region, p.getFirst("NetworkInterfaceId"),
-                getList(p, "Ipv6Address"));
+                getList(p, "Ipv6Addresses", "Ipv6Address"));
         XmlBuilder xml = new XmlBuilder()
                 .start("UnassignIpv6AddressesResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
