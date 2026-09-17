@@ -30,12 +30,21 @@ public final class SecurityGroupNftCompiler {
                     transportAddress, null, groupIds, groups);
         }
 
+        /** Keeps the immutable ENI identity and swaps only the policy the manager re-resolved. */
+        public Endpoint withPolicy(Set<String> groupIds, List<SecurityGroup> groups) {
+            return new Endpoint(accountId, region, vpcId, eniId, logicalAddress, logicalIpv6Address,
+                    transportAddress, transportIpv6Address, groupIds, groups);
+        }
+
         SecurityGroupPolicy.Peer peer(String address) {
             return new SecurityGroupPolicy.Peer(address, accountId, vpcId, groupIds);
         }
     }
 
     private record AddressIdentity(String logical, String transport) {}
+
+    /** A peer's address identities resolved once, so the rule loops never re-parse them. */
+    private record ManagedPeer(Endpoint peer, List<AddressIdentity> identities, boolean sameScope) {}
 
     public static String initialRuleset() {
         return "add table inet floci_sg\n"
@@ -62,8 +71,9 @@ public final class SecurityGroupNftCompiler {
                 .append("add rule inet floci_sg egress ip daddr 169.254.169.254 accept\n")
                 .append("add rule inet floci_sg ingress ip saddr 169.254.169.254 accept\n");
 
-        List<Endpoint> managed = peers == null ? List.of() : peers.stream()
+        List<ManagedPeer> managed = peers == null ? List.of() : peers.stream()
                 .filter(peer -> !target.eniId().equals(peer.eniId()))
+                .map(peer -> new ManagedPeer(peer, identities(peer), sameScope(target, peer)))
                 .toList();
 
         for (boolean egress : new boolean[]{false, true}) {
@@ -80,13 +90,13 @@ public final class SecurityGroupNftCompiler {
                     if (protocol == null) {
                         continue;
                     }
-                    for (Endpoint peer : managed) {
-                        if (!sameScope(target, peer)) {
+                    for (ManagedPeer managedPeer : managed) {
+                        if (!managedPeer.sameScope()) {
                             continue;
                         }
-                        for (AddressIdentity identity : identities(peer)) {
+                        for (AddressIdentity identity : managedPeer.identities()) {
                             if (SecurityGroupPolicy.matchesPeer(group, permission,
-                                    peer.peer(identity.logical()), prefixLists)) {
+                                    managedPeer.peer().peer(identity.logical()), prefixLists)) {
                                 appendRule(rules, chain, addressField, identity.transport(), protocol);
                             }
                         }
@@ -95,8 +105,8 @@ public final class SecurityGroupNftCompiler {
             }
             // A managed peer must never fall through to a broad external CIDR rule
             // evaluated against its Docker bridge IP instead of its logical ENI address.
-            for (Endpoint peer : managed) {
-                for (AddressIdentity identity : identities(peer)) {
+            for (ManagedPeer managedPeer : managed) {
+                for (AddressIdentity identity : managedPeer.identities()) {
                     appendRule(rules, chain, addressField, identity.transport(), "drop");
                 }
             }

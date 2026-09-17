@@ -78,11 +78,6 @@ public class NetworkInterface {
     public List<NetworkInterfacePrivateIpAddress> getPrivateIpAddresses() { return privateIpAddresses; }
     public void setPrivateIpAddresses(List<NetworkInterfacePrivateIpAddress> privateIpAddresses) { this.privateIpAddresses = privateIpAddresses; }
 
-    public List<String> getIpv6Addresses() {
-        if (ipv6Addresses == null) {
-            ipv6Addresses = new ArrayList<>();
-        }
-        return ipv6Addresses;
-    }
+    public List<String> getIpv6Addresses() { return ipv6Addresses; }
     public void setIpv6Addresses(List<String> ipv6Addresses) { this.ipv6Addresses = ipv6Addresses; }
 }

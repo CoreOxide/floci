@@ -70,11 +70,6 @@ public class InstanceNetworkInterface {
     public String getAttachTime() { return attachTime; }
     public void setAttachTime(String attachTime) { this.attachTime = attachTime; }
 
-    public List<String> getIpv6Addresses() {
-        if (ipv6Addresses == null) {
-            ipv6Addresses = new ArrayList<>();
-        }
-        return ipv6Addresses;
-    }
+    public List<String> getIpv6Addresses() { return ipv6Addresses; }
     public void setIpv6Addresses(List<String> ipv6Addresses) { this.ipv6Addresses = ipv6Addresses; }
 }

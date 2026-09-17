@@ -2687,7 +2687,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                     eni.setIpv6Addresses(new ArrayList<>(suppliedEni.getIpv6Addresses()));
                 } else if (subnet != null && subnet.isAssignIpv6AddressOnCreation()
                         && !subnet.getIpv6CidrBlockAssociationSet().isEmpty()) {
-                    eni.setIpv6Addresses(List.of(assignIpv6(region, finalSubnetId)));
+                    eni.setIpv6Addresses(new ArrayList<>(assignIpv6(region, finalSubnetId, 1)));
                 }
                 eni.setGroups(new ArrayList<>(sgIdentifiers));
                 eni.setAttachmentId("eni-attach-" + randomHex(17));
@@ -2851,14 +2851,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                 && config.network().securityGroupEnforcement().enabled();
     }
 
+    /** Every security group of a region with the prefix lists its rules reference. */
+    private record RegionPolicy(Map<String, SecurityGroup> byId, Map<String, List<String>> prefixLists) {}
+
+    private RegionPolicy regionPolicy(String region) {
+        List<SecurityGroup> current = securityGroups.scan(k -> k.startsWith(region + "::"));
+        return new RegionPolicy(current.stream()
+                .collect(Collectors.toMap(SecurityGroup::getGroupId, Function.identity())),
+                policyPrefixLists(region, current));
+    }
+
     private void reconcileFirewallPolicies(String region) {
         if (!securityGroupEnforcementEnabled() || config.services().ec2().mock()) {
             return;
         }
-        List<SecurityGroup> current = securityGroups.scan(k -> k.startsWith(region + "::"));
-        Map<String, SecurityGroup> byId = current.stream()
-                .collect(Collectors.toMap(SecurityGroup::getGroupId, Function.identity()));
-        containerManager.refreshSecurityGroups(region, byId, policyPrefixLists(region, current));
+        RegionPolicy policy = regionPolicy(region);
+        containerManager.refreshSecurityGroups(region, policy.byId(), policy.prefixLists());
     }
 
     private void restoreInstanceFirewall(Instance instance) {
@@ -2875,18 +2883,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
     }
 
     /**
-     * Recompiles the firewall of a protected endpoint keyed on an ENI with no instance attachment,
-     * an ECS {@code awsvpc} task's interface. No-op for interfaces the firewall manager does not hold.
+     * Recompiles the firewall of the protected endpoint keyed on an ENI, whether it belongs to an
+     * EC2 instance or an ECS {@code awsvpc} task. No-op for interfaces the firewall manager does
+     * not hold, so an unprotected or stopped workload needs no caller-side guard.
      */
     private void updateNetworkInterfaceFirewall(String region, String networkInterfaceId, List<String> groupIds) {
         if (!securityGroupEnforcementEnabled() || config.services().ec2().mock()) {
             return;
         }
-        List<SecurityGroup> current = securityGroups.scan(k -> k.startsWith(region + "::"));
-        Map<String, SecurityGroup> byId = current.stream()
-                .collect(Collectors.toMap(SecurityGroup::getGroupId, Function.identity()));
-        containerManager.updateSecurityGroups(networkInterfaceId, new HashSet<>(groupIds), byId,
-                policyPrefixLists(region, current));
+        RegionPolicy policy = regionPolicy(region);
+        containerManager.updateSecurityGroups(networkInterfaceId, new HashSet<>(groupIds), policy.byId(),
+                policy.prefixLists());
     }
 
     /**
@@ -3004,7 +3011,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         return parts[0] + "." + parts[1] + "." + parts[2] + "." + offset;
     }
 
-    private String assignIpv6(String region, String subnetId) {
+    /**
+     * Generates {@code count} IPv6 addresses from the subnet's associated CIDR that no ENI in the
+     * region holds yet. The subnet, the CIDR base and the addresses already in use are resolved
+     * once per call, so assigning several addresses costs one pass over the stores.
+     */
+    private List<String> assignIpv6(String region, String subnetId, int count) {
+        if (count <= 0) {
+            return List.of();
+        }
         Subnet subnet = requireSubnet(region, subnetId);
         String cidr = subnet.getIpv6CidrBlockAssociationSet().stream()
                 .filter(association -> "associated".equals(association.getIpv6CidrBlockState()))
@@ -3013,36 +3028,42 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                 .findFirst()
                 .orElseThrow(() -> new AwsException("InvalidParameterValue",
                         "Subnet '" + subnetId + "' has no associated IPv6 CIDR block", 400));
-        String[] parts = cidr.split("/", 2);
+        Set<String> used = usedIpv6Addresses(region);
+        AtomicInteger counter = subnetIpv6Counters.computeIfAbsent(region + "::" + subnetId,
+                ignored -> new AtomicInteger(10));
         try {
-            byte[] base = InetAddress.getByName(parts[0]).getAddress();
+            byte[] base = InetAddress.ofLiteral(cidr.split("/", 2)[0]).getAddress();
             if (base.length != 16) {
-                throw new UnknownHostException(cidr);
+                throw new IllegalArgumentException(cidr);
             }
-            AtomicInteger counter = subnetIpv6Counters.computeIfAbsent(region + "::" + subnetId,
-                    ignored -> new AtomicInteger(10));
-            while (true) {
-                byte[] raw = new BigInteger(1, base).add(BigInteger.valueOf(counter.getAndIncrement())).toByteArray();
+            BigInteger network = new BigInteger(1, base);
+            List<String> generated = new ArrayList<>(count);
+            while (generated.size() < count) {
+                byte[] raw = network.add(BigInteger.valueOf(counter.getAndIncrement())).toByteArray();
                 byte[] address = new byte[16];
                 System.arraycopy(raw, Math.max(0, raw.length - address.length), address,
                         Math.max(0, address.length - raw.length), Math.min(raw.length, address.length));
-                String candidate = InetAddress.getByAddress(address).getHostAddress();
-                if (!ipv6AddressInUse(region, candidate)) {
-                    return candidate;
+                // AWS reports IPv6 in RFC 5952 compressed form, which getHostAddress does not produce.
+                String candidate = CidrCanonicalizer.hostAddress(InetAddress.getByAddress(address));
+                if (used.add(candidate)) {
+                    generated.add(candidate);
                 }
             }
-        } catch (UnknownHostException e) {
+            return generated;
+        } catch (IllegalArgumentException | UnknownHostException e) {
             throw new AwsException("InvalidParameterValue", "Invalid subnet IPv6 CIDR '" + cidr + "'", 400);
         }
     }
 
-    private boolean ipv6AddressInUse(String region, String address) {
+    private Set<String> usedIpv6Addresses(String region) {
         String prefix = region + "::";
-        return networkInterfaces.scan(key -> key.startsWith(prefix)).stream()
-                .anyMatch(networkInterface -> networkInterface.getIpv6Addresses().contains(address))
-                || instances.scan(key -> key.startsWith(prefix)).stream()
+        Set<String> used = new HashSet<>();
+        networkInterfaces.scan(key -> key.startsWith(prefix))
+                .forEach(networkInterface -> used.addAll(networkInterface.getIpv6Addresses()));
+        instances.scan(key -> key.startsWith(prefix)).stream()
                 .flatMap(instance -> instance.getNetworkInterfaces().stream())
-                .anyMatch(networkInterface -> networkInterface.getIpv6Addresses().contains(address));
+                .forEach(networkInterface -> used.addAll(networkInterface.getIpv6Addresses()));
+        return used;
     }
 
     public List<Reservation> describeInstances(String region, List<String> instanceIds, Map<String, List<String>> filters) {
@@ -3422,23 +3443,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         ensureDefaultResources(region);
         Instance inst = getRequiredInstance(region, instanceId);
 
-        List<GroupIdentifier> identifiers = new ArrayList<>();
-        for (String groupId : groupIds) {
-            SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
-            if (!Objects.equals(inst.getVpcId(), sg.getVpcId())) {
-                throw new AwsException("InvalidGroup.NotFound", "Security group is not in the instance VPC", 400);
-            }
-            identifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
-        }
+        List<GroupIdentifier> identifiers = resolveGroupsInVpc(region, inst.getVpcId(), groupIds, "instance");
 
-        if (securityGroupEnforcementEnabled() && !config.services().ec2().mock()
-                && inst.getState() != null && "running".equals(inst.getState().getName())
-                && inst.getNetworkInterfaces() != null && !inst.getNetworkInterfaces().isEmpty()) {
-            List<SecurityGroup> current = securityGroups.scan(k -> k.startsWith(region + "::"));
-            Map<String, SecurityGroup> byId = current.stream().collect(Collectors.toMap(
-                    SecurityGroup::getGroupId, Function.identity()));
-            containerManager.updateSecurityGroups(inst.getNetworkInterfaces().getFirst().getNetworkInterfaceId(),
-                    new HashSet<>(groupIds), byId, policyPrefixLists(region, current));
+        if (inst.getNetworkInterfaces() != null && !inst.getNetworkInterfaces().isEmpty()) {
+            updateNetworkInterfaceFirewall(region,
+                    inst.getNetworkInterfaces().getFirst().getNetworkInterfaceId(), groupIds);
         }
 
         inst.setSecurityGroups(new ArrayList<>(identifiers));
@@ -7967,14 +7976,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
 
         List<GroupIdentifier> sgIdentifiers = new ArrayList<>();
         if (securityGroupIds != null && !securityGroupIds.isEmpty()) {
-            for (String sgId : securityGroupIds) {
-                SecurityGroup sg = getRequiredSecurityGroup(region, sgId);
-                if (!subnet.getVpcId().equals(sg.getVpcId())) {
-                    throw new AwsException("InvalidGroup.NotFound",
-                            "Security group " + sgId + " does not belong to the subnet VPC", 400);
-                }
-                sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
-            }
+            sgIdentifiers.addAll(resolveGroupsInVpc(region, subnet.getVpcId(), securityGroupIds, "subnet"));
         } else {
             SecurityGroup defaultSg = securityGroups.scan(k -> k.startsWith(region + "::")).stream()
                     .filter(group -> subnet.getVpcId().equals(group.getVpcId())
@@ -8026,30 +8028,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         }
         ni.setPrivateIpAddresses(ipList);
 
-        LinkedHashSet<String> assignedIpv6 = new LinkedHashSet<>();
-        if (ipv6Addresses != null) {
-            for (String address : ipv6Addresses) {
-                if (address == null || address.isBlank()) {
-                    continue;
-                }
-                boolean inSubnet = subnet.getIpv6CidrBlockAssociationSet().stream()
-                        .filter(association -> "associated".equals(association.getIpv6CidrBlockState()))
-                        .anyMatch(association -> SecurityGroupPolicy.inCidr(address,
-                                association.getIpv6CidrBlock()));
-                if (!inSubnet) {
-                    throw new AwsException("InvalidParameterValue",
-                            "IPv6 address '" + address + "' is not in subnet '" + subnetId + "'", 400);
-                }
-                assignedIpv6.add(address);
-            }
-        }
+        LinkedHashSet<String> assignedIpv6 = requestedIpv6InSubnet(subnet, ipv6Addresses);
         int generatedCount = requestedIpv6Count;
         if (assignedIpv6.isEmpty() && ipv6AddressCount == null && subnet.isAssignIpv6AddressOnCreation()) {
             generatedCount = 1;
         }
-        for (int i = 0; i < generatedCount; i++) {
-            assignedIpv6.add(assignIpv6(region, subnetId));
-        }
+        assignedIpv6.addAll(assignIpv6(region, subnetId, generatedCount));
         ni.setIpv6Addresses(new ArrayList<>(assignedIpv6));
 
         networkInterfaces.put(key(region, eniId), ni);
@@ -8066,29 +8050,63 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         networkInterfaces.delete(key(region, networkInterfaceId));
     }
 
+    /** Resolves security group ids that must live in {@code vpcId}, as AWS validates them. */
+    private List<GroupIdentifier> resolveGroupsInVpc(String region, String vpcId, List<String> groupIds,
+                                                     String owner) {
+        List<GroupIdentifier> resolved = new ArrayList<>();
+        for (String groupId : groupIds) {
+            SecurityGroup group = getRequiredSecurityGroup(region, groupId);
+            if (!Objects.equals(vpcId, group.getVpcId())) {
+                throw new AwsException("InvalidGroup.NotFound",
+                        "Security group " + groupId + " does not belong to the " + owner + " VPC", 400);
+            }
+            resolved.add(new GroupIdentifier(group.getGroupId(), group.getGroupName()));
+        }
+        return resolved;
+    }
+
+    /** Keeps only the requested IPv6 addresses, rejecting any outside an associated subnet CIDR. */
+    private LinkedHashSet<String> requestedIpv6InSubnet(Subnet subnet, List<String> requested) {
+        LinkedHashSet<String> accepted = new LinkedHashSet<>();
+        if (requested == null) {
+            return accepted;
+        }
+        for (String address : requested) {
+            if (address == null || address.isBlank()) {
+                continue;
+            }
+            boolean inSubnet = subnet.getIpv6CidrBlockAssociationSet().stream()
+                    .filter(association -> "associated".equals(association.getIpv6CidrBlockState()))
+                    .anyMatch(association -> SecurityGroupPolicy.inCidr(address,
+                            association.getIpv6CidrBlock()));
+            if (!inSubnet) {
+                throw new AwsException("InvalidParameterValue",
+                        "IPv6 address '" + address + "' is not in subnet '" + subnet.getSubnetId() + "'", 400);
+            }
+            accepted.add(address);
+        }
+        return accepted;
+    }
+
     public void modifyNetworkInterfaceGroups(String region, String networkInterfaceId, List<String> groupIds) {
         NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
         if (groupIds == null || groupIds.isEmpty()) {
             throw new AwsException("InvalidParameterValue", "At least one security group is required", 400);
         }
-        List<GroupIdentifier> groups = new ArrayList<>();
-        for (String groupId : groupIds) {
-            SecurityGroup group = getRequiredSecurityGroup(region, groupId);
-            if (!ni.getVpcId().equals(group.getVpcId())) {
-                throw new AwsException("InvalidGroup.NotFound",
-                        "Security group " + groupId + " does not belong to the network interface VPC", 400);
-            }
-            groups.add(new GroupIdentifier(group.getGroupId(), group.getGroupName()));
-        }
+        List<GroupIdentifier> groups = resolveGroupsInVpc(region, ni.getVpcId(), groupIds, "network interface");
         ni.setGroups(groups);
         networkInterfaces.put(key(region, networkInterfaceId), ni);
-        // A protected endpoint registered on the interface itself rather than on an instance (an ECS
-        // awsvpc task's ENI) has no attachment for updateAttachedNetworkInterface to follow, so its
-        // ruleset is refreshed here or the helper keeps enforcing groups the interface no longer carries.
-        if (ni.getAttachment() == null) {
-            updateNetworkInterfaceFirewall(region, networkInterfaceId, groupIds);
+        Instance instance = updateAttachedNetworkInterface(region, ni,
+                attached -> attached.setGroups(new ArrayList<>(groups)));
+        if (instance != null) {
+            instance.getNetworkInterfaces().stream().filter(attached -> attached.getDeviceIndex() == 0)
+                    .findFirst()
+                    .ifPresent(primary -> instance.setSecurityGroups(new ArrayList<>(primary.getGroups())));
+            instances.put(key(region, instance.getInstanceId()), instance);
         }
-        updateAttachedNetworkInterface(region, ni, attached -> attached.setGroups(new ArrayList<>(groups)));
+        // The firewall manager keys endpoints on the ENI, so one call covers both an ECS awsvpc
+        // task's standalone interface and an interface attached to an EC2 instance.
+        updateNetworkInterfaceFirewall(region, networkInterfaceId, groupIds);
     }
 
     public List<String> assignIpv6Addresses(String region, String networkInterfaceId,
@@ -8105,31 +8123,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                     "Specify either Ipv6Address or Ipv6AddressCount", 400);
         }
         Subnet subnet = requireSubnet(region, ni.getSubnetId());
-        LinkedHashSet<String> assigned = new LinkedHashSet<>();
-        if (requested != null) {
-            for (String address : requested) {
-                if (address == null || address.isBlank()) {
-                    continue;
-                }
-                boolean inSubnet = subnet.getIpv6CidrBlockAssociationSet().stream()
-                        .anyMatch(association -> SecurityGroupPolicy.inCidr(address,
-                                association.getIpv6CidrBlock()));
-                if (!inSubnet) {
-                    throw new AwsException("InvalidParameterValue",
-                            "IPv6 address '" + address + "' is not in subnet '" + ni.getSubnetId() + "'", 400);
-                }
-                assigned.add(address);
-            }
-        }
-        for (int i = 0; i < requestedCount; i++) {
-            assigned.add(assignIpv6(region, ni.getSubnetId()));
-        }
+        LinkedHashSet<String> assigned = requestedIpv6InSubnet(subnet, requested);
+        assigned.addAll(assignIpv6(region, ni.getSubnetId(), requestedCount));
         List<String> newlyAssigned = assigned.stream()
                 .filter(address -> !ni.getIpv6Addresses().contains(address)).toList();
+        if (newlyAssigned.isEmpty()) {
+            return newlyAssigned;
+        }
         ni.getIpv6Addresses().addAll(newlyAssigned);
-        networkInterfaces.put(key(region, networkInterfaceId), ni);
-        updateAttachedNetworkInterface(region, ni,
-                attached -> attached.setIpv6Addresses(new ArrayList<>(ni.getIpv6Addresses())));
+        persistIpv6Change(region, ni);
         return newlyAssigned;
     }
 
@@ -8137,26 +8139,39 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
         List<String> removed = addresses == null ? List.of() : addresses.stream()
                 .filter(ni.getIpv6Addresses()::contains).distinct().toList();
+        if (removed.isEmpty()) {
+            return removed;
+        }
         ni.getIpv6Addresses().removeAll(removed);
-        networkInterfaces.put(key(region, networkInterfaceId), ni);
-        updateAttachedNetworkInterface(region, ni,
-                attached -> attached.setIpv6Addresses(new ArrayList<>(ni.getIpv6Addresses())));
+        persistIpv6Change(region, ni);
         return removed;
     }
 
-    private void updateAttachedNetworkInterface(String region, NetworkInterface ni,
-                                                Consumer<InstanceNetworkInterface> update) {
+    /**
+     * Stores an ENI whose IPv6 addresses changed and re-registers the firewall of the instance it
+     * is attached to, because a managed IPv6 identity is part of the compiled policy.
+     */
+    private void persistIpv6Change(String region, NetworkInterface ni) {
+        networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
+        Instance instance = updateAttachedNetworkInterface(region, ni,
+                attached -> attached.setIpv6Addresses(new ArrayList<>(ni.getIpv6Addresses())));
+        if (instance != null) {
+            restoreInstanceFirewall(instance);
+        }
+    }
+
+    /** Mirrors an ENI change onto the instance holding it. Returns null when nothing is attached. */
+    private Instance updateAttachedNetworkInterface(String region, NetworkInterface ni,
+                                                    Consumer<InstanceNetworkInterface> update) {
         if (ni.getAttachment() == null) {
-            return;
+            return null;
         }
         Instance instance = getRequiredInstance(region, ni.getAttachment().getInstanceId());
         instance.getNetworkInterfaces().stream()
                 .filter(attached -> ni.getNetworkInterfaceId().equals(attached.getNetworkInterfaceId()))
                 .findFirst().ifPresent(update);
-        instance.getNetworkInterfaces().stream().filter(attached -> attached.getDeviceIndex() == 0)
-                .findFirst().ifPresent(primary -> instance.setSecurityGroups(new ArrayList<>(primary.getGroups())));
         instances.put(key(region, instance.getInstanceId()), instance);
-        restoreInstanceFirewall(instance);
+        return instance;
     }
 
     /**

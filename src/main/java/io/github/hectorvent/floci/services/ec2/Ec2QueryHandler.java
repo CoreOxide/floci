@@ -4271,14 +4271,20 @@ public class Ec2QueryHandler {
             }
             xml.end("privateIpAddressesSet");
         }
-        if (!ni.getIpv6Addresses().isEmpty()) {
-            xml.start("ipv6AddressesSet");
-            for (String address : ni.getIpv6Addresses()) {
-                xml.start("item").elem("ipv6Address", address).end("item");
-            }
-            xml.end("ipv6AddressesSet");
-        }
+        appendIpv6AddressesSet(xml, ni.getIpv6Addresses());
         return xml.build();
+    }
+
+    /** AWS omits the element entirely on an interface with no IPv6 address. */
+    private void appendIpv6AddressesSet(XmlBuilder xml, List<String> addresses) {
+        if (addresses.isEmpty()) {
+            return;
+        }
+        xml.start("ipv6AddressesSet");
+        for (String address : addresses) {
+            xml.start("item").elem("ipv6Address", address).end("item");
+        }
+        xml.end("ipv6AddressesSet");
     }
 
     private Response handleCreateNetworkInterface(MultivaluedMap<String, String> p, String region) {
@@ -4335,30 +4341,29 @@ public class Ec2QueryHandler {
     }
 
     private Response handleAssignIpv6Addresses(MultivaluedMap<String, String> p, String region) {
-        List<String> addresses = getList(p, "Ipv6Addresses", "Ipv6Address");
-        Integer count = intParam(p, "Ipv6AddressCount");
         List<String> assigned = service.assignIpv6Addresses(region, p.getFirst("NetworkInterfaceId"),
-                addresses, count);
-        XmlBuilder xml = new XmlBuilder()
-                .start("AssignIpv6AddressesResponse", AwsNamespaces.EC2)
-                .elem("requestId", UUID.randomUUID().toString())
-                .elem("networkInterfaceId", p.getFirst("NetworkInterfaceId"))
-                .start("assignedIpv6Addresses");
-        assigned.forEach(address -> xml.elem("item", address));
-        xml.end("assignedIpv6Addresses").end("AssignIpv6AddressesResponse");
-        return xmlResponse(xml.build());
+                getList(p, "Ipv6Addresses", "Ipv6Address"), intParam(p, "Ipv6AddressCount"));
+        return ipv6AddressesResponse("AssignIpv6Addresses", "assignedIpv6Addresses",
+                p.getFirst("NetworkInterfaceId"), assigned);
     }
 
     private Response handleUnassignIpv6Addresses(MultivaluedMap<String, String> p, String region) {
         List<String> removed = service.unassignIpv6Addresses(region, p.getFirst("NetworkInterfaceId"),
                 getList(p, "Ipv6Addresses", "Ipv6Address"));
+        return ipv6AddressesResponse("UnassignIpv6Addresses", "unassignedIpv6Addresses",
+                p.getFirst("NetworkInterfaceId"), removed);
+    }
+
+    /** Both IPv6 assignment actions answer with the same shape under a differently named list. */
+    private Response ipv6AddressesResponse(String action, String listName, String networkInterfaceId,
+                                           List<String> addresses) {
         XmlBuilder xml = new XmlBuilder()
-                .start("UnassignIpv6AddressesResponse", AwsNamespaces.EC2)
+                .start(action + "Response", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
-                .elem("networkInterfaceId", p.getFirst("NetworkInterfaceId"))
-                .start("unassignedIpv6Addresses");
-        removed.forEach(address -> xml.elem("item", address));
-        xml.end("unassignedIpv6Addresses").end("UnassignIpv6AddressesResponse");
+                .elem("networkInterfaceId", networkInterfaceId)
+                .start(listName);
+        addresses.forEach(address -> xml.elem("item", address));
+        xml.end(listName).end(action + "Response");
         return xmlResponse(xml.build());
     }
 
@@ -4466,13 +4471,7 @@ public class Ec2QueryHandler {
                     .elem("primary", "true")
                     .end("item")
                     .end("privateIpAddressesSet");
-            if (!eni.getIpv6Addresses().isEmpty()) {
-                xml.start("ipv6AddressesSet");
-                for (String address : eni.getIpv6Addresses()) {
-                    xml.start("item").elem("ipv6Address", address).end("item");
-                }
-                xml.end("ipv6AddressesSet");
-            }
+            appendIpv6AddressesSet(xml, eni.getIpv6Addresses());
             xml.end("item");
         }
         xml.end("networkInterfaceSet");
