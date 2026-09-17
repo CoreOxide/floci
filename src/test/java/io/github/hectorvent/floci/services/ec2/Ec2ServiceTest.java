@@ -59,6 +59,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -71,6 +72,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -221,6 +223,29 @@ class Ec2ServiceTest {
 
         assertTrue(matched.stream()
                 .anyMatch(n -> eni.getNetworkInterfaceId().equals(n.getNetworkInterfaceId())));
+    }
+
+    @Test
+    void modifyNetworkInterfaceGroupsRefreshesTheFirewallOfAnUnattachedInterface() {
+        // An ECS awsvpc task's ENI is a protected endpoint with no instance attachment, so the
+        // instance-side refresh path skips it: the group change has to reach the firewall manager
+        // directly or the task's helper keeps enforcing the groups it no longer carries.
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(enforcingConfig(), containerManager,
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        Vpc vpc = service.describeVpcs("us-east-1", List.of(), Map.of()).getFirst();
+        Subnet subnet = service.createSubnet("us-east-1", vpc.getVpcId(), "10.78.0.0/24", null, null, null);
+        NetworkInterface eni = service.createNetworkInterface("us-east-1", subnet.getSubnetId(), null,
+                null, List.of(), List.of(), List.of());
+        SecurityGroup locked = service.createSecurityGroup("us-east-1", "locked", "locked down", vpc.getVpcId());
+
+        service.modifyNetworkInterfaceGroups("us-east-1", eni.getNetworkInterfaceId(),
+                List.of(locked.getGroupId()));
+
+        assertNull(eni.getAttachment());
+        verify(containerManager).updateSecurityGroups(eq(eni.getNetworkInterfaceId()),
+                eq(Set.of(locked.getGroupId())), any(), any());
     }
 
     @Test
@@ -3900,6 +3925,18 @@ class Ec2ServiceTest {
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
         when(ec2.mock()).thenReturn(ec2Mock);
+        return config;
+    }
+
+    /** A real-Docker config with security-group enforcement on, the shipped default. */
+    private static EmulatorConfig enforcingConfig() {
+        EmulatorConfig config = mockConfig(false);
+        EmulatorConfig.NetworkConfig network = mock(EmulatorConfig.NetworkConfig.class);
+        EmulatorConfig.SecurityGroupEnforcementConfig enforcement =
+                mock(EmulatorConfig.SecurityGroupEnforcementConfig.class);
+        when(config.network()).thenReturn(network);
+        when(network.securityGroupEnforcement()).thenReturn(enforcement);
+        when(enforcement.enabled()).thenReturn(true);
         return config;
     }
 

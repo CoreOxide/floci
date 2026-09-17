@@ -2875,6 +2875,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
     }
 
     /**
+     * Recompiles the firewall of a protected endpoint keyed on an ENI with no instance attachment,
+     * an ECS {@code awsvpc} task's interface. No-op for interfaces the firewall manager does not hold.
+     */
+    private void updateNetworkInterfaceFirewall(String region, String networkInterfaceId, List<String> groupIds) {
+        if (!securityGroupEnforcementEnabled() || config.services().ec2().mock()) {
+            return;
+        }
+        List<SecurityGroup> current = securityGroups.scan(k -> k.startsWith(region + "::"));
+        Map<String, SecurityGroup> byId = current.stream()
+                .collect(Collectors.toMap(SecurityGroup::getGroupId, Function.identity()));
+        containerManager.updateSecurityGroups(networkInterfaceId, new HashSet<>(groupIds), byId,
+                policyPrefixLists(region, current));
+    }
+
+    /**
      * Re-publishes host forwards for every running instance attached to the given security group,
      * so ports opened or closed via authorize/revoke ingress take effect on already-running
      * instances. No-op in mock mode or when publishing is disabled.
@@ -8067,6 +8082,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
         }
         ni.setGroups(groups);
         networkInterfaces.put(key(region, networkInterfaceId), ni);
+        // A protected endpoint registered on the interface itself rather than on an instance (an ECS
+        // awsvpc task's ENI) has no attachment for updateAttachedNetworkInterface to follow, so its
+        // ruleset is refreshed here or the helper keeps enforcing groups the interface no longer carries.
+        if (ni.getAttachment() == null) {
+            updateNetworkInterfaceFirewall(region, networkInterfaceId, groupIds);
+        }
         updateAttachedNetworkInterface(region, ni, attached -> attached.setGroups(new ArrayList<>(groups)));
     }
 
